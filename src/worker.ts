@@ -3,13 +3,15 @@
  *
  * Implements the MCP JSON-RPC protocol over Streamable HTTP.
  * Uses native fetch (no axios/express) for Workers compatibility.
+ * OAuth 2.0 Authorization Code flow (with PKCE) for Claude.ai authentication.
  *
  * Deploy:
  *   npx wrangler deploy
  *
  * Set secrets:
  *   npx wrangler secret put NOTION_TOKEN
- *   npx wrangler secret put AUTH_TOKEN
+ *   npx wrangler secret put OAUTH_CLIENT_ID
+ *   npx wrangler secret put OAUTH_CLIENT_SECRET
  */
 
 import { OpenAPIToMCPConverter } from './openapi-mcp-server/openapi/parser'
@@ -25,7 +27,8 @@ import notionSpec from '../scripts/notion-openapi.json'
 
 interface Env {
   NOTION_TOKEN: string
-  AUTH_TOKEN?: string
+  OAUTH_CLIENT_ID: string
+  OAUTH_CLIENT_SECRET: string
 }
 
 interface JsonRpcRequest {
@@ -57,6 +60,260 @@ type ToolHandler = (params: Record<string, unknown>) => Promise<{
 interface ToolEntry {
   tool: ToolDef
   handler: ToolHandler
+}
+
+// ---------------------------------------------------------------------------
+// OAuth 2.0 Authorization Code flow with PKCE
+// ---------------------------------------------------------------------------
+
+// Base64url encode bytes
+function base64urlEncode(data: Uint8Array): string {
+  let binary = ''
+  for (const byte of data) binary += String.fromCharCode(byte)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+// Base64url encode string
+function base64urlEncodeString(str: string): string {
+  return base64urlEncode(new TextEncoder().encode(str))
+}
+
+// Base64url decode to string
+function base64urlDecodeString(str: string): string {
+  const padded = str.replace(/-/g, '+').replace(/_/g, '/') + '=='.slice(0, (4 - (str.length % 4)) % 4)
+  const binary = atob(padded)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return new TextDecoder().decode(bytes)
+}
+
+// HMAC-SHA256 sign
+async function hmacSign(data: string, secret: string): Promise<string> {
+  const encoder = new TextEncoder()
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(data))
+  return base64urlEncode(new Uint8Array(sig))
+}
+
+// Generate a deterministic access token from client credentials
+async function generateAccessToken(clientId: string, clientSecret: string): Promise<string> {
+  const encoder = new TextEncoder()
+  const data = encoder.encode(`${clientId}:${clientSecret}`)
+  const hash = await crypto.subtle.digest('SHA-256', data)
+  const bytes = new Uint8Array(hash)
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+// Verify PKCE code_challenge against code_verifier
+async function verifyPkce(
+  codeVerifier: string,
+  codeChallenge: string,
+  method: string | null,
+): Promise<boolean> {
+  if (!method || method === 'plain') {
+    return codeVerifier === codeChallenge
+  }
+  if (method === 'S256') {
+    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier))
+    const computed = base64urlEncode(new Uint8Array(hash))
+    return computed === codeChallenge
+  }
+  return false
+}
+
+async function validateOAuthToken(request: Request, env: Env): Promise<boolean> {
+  if (!env.OAUTH_CLIENT_ID || !env.OAUTH_CLIENT_SECRET) {
+    return true // No OAuth configured → allow all
+  }
+
+  const authHeader = request.headers.get('Authorization')
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null
+  if (!token) return false
+
+  const expected = await generateAccessToken(env.OAUTH_CLIENT_ID, env.OAUTH_CLIENT_SECRET)
+  return token === expected
+}
+
+function handleOAuthMetadata(request: Request): Response {
+  const url = new URL(request.url)
+  const baseUrl = `${url.protocol}//${url.host}`
+
+  return Response.json({
+    issuer: baseUrl,
+    authorization_endpoint: `${baseUrl}/authorize`,
+    token_endpoint: `${baseUrl}/oauth/token`,
+    token_endpoint_auth_methods_supported: ['client_secret_post'],
+    grant_types_supported: ['authorization_code'],
+    response_types_supported: ['code'],
+    code_challenge_methods_supported: ['S256', 'plain'],
+    scopes_supported: ['mcp'],
+  })
+}
+
+function handleProtectedResourceMetadata(request: Request): Response {
+  const url = new URL(request.url)
+  const baseUrl = `${url.protocol}//${url.host}`
+
+  return Response.json({
+    resource: `${baseUrl}/mcp`,
+    authorization_servers: [baseUrl],
+    scopes_supported: ['mcp'],
+  })
+}
+
+// GET /authorize — auto-approves and redirects back with an authorization code
+async function handleAuthorize(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url)
+  const clientId = url.searchParams.get('client_id')
+  const redirectUri = url.searchParams.get('redirect_uri')
+  const state = url.searchParams.get('state')
+  const codeChallenge = url.searchParams.get('code_challenge')
+  const codeChallengeMethod = url.searchParams.get('code_challenge_method')
+  const responseType = url.searchParams.get('response_type')
+
+  if (responseType !== 'code') {
+    return Response.json({ error: 'unsupported_response_type' }, { status: 400 })
+  }
+
+  if (clientId !== env.OAUTH_CLIENT_ID) {
+    return Response.json({ error: 'invalid_client' }, { status: 401 })
+  }
+
+  if (!redirectUri) {
+    return Response.json({ error: 'invalid_request', error_description: 'redirect_uri required' }, { status: 400 })
+  }
+
+  // Build a self-contained authorization code (signed, stateless)
+  const payload = JSON.stringify({
+    cid: clientId,
+    uri: redirectUri,
+    cc: codeChallenge || '',
+    ccm: codeChallengeMethod || '',
+    exp: Date.now() + 5 * 60 * 1000, // 5 min expiry
+  })
+  const payloadB64 = base64urlEncodeString(payload)
+  const signature = await hmacSign(payload, env.OAUTH_CLIENT_SECRET)
+  const code = `${payloadB64}.${signature}`
+
+  // Redirect back to Claude.ai with the code
+  const callbackUrl = new URL(redirectUri)
+  callbackUrl.searchParams.set('code', code)
+  if (state) callbackUrl.searchParams.set('state', state)
+
+  return Response.redirect(callbackUrl.toString(), 302)
+}
+
+// POST /oauth/token — exchanges authorization code for access token
+async function handleTokenRequest(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405 })
+  }
+
+  let params: URLSearchParams
+
+  const contentType = request.headers.get('Content-Type') || ''
+  if (contentType.includes('application/x-www-form-urlencoded')) {
+    params = new URLSearchParams(await request.text())
+  } else if (contentType.includes('application/json')) {
+    const body = (await request.json()) as Record<string, string>
+    params = new URLSearchParams(body)
+  } else {
+    params = new URLSearchParams(await request.text())
+  }
+
+  const grantType = params.get('grant_type')
+  const clientId = params.get('client_id')
+  const clientSecret = params.get('client_secret')
+
+  // Validate client credentials
+  if (clientId !== env.OAUTH_CLIENT_ID || clientSecret !== env.OAUTH_CLIENT_SECRET) {
+    return Response.json({ error: 'invalid_client' }, { status: 401 })
+  }
+
+  if (grantType === 'authorization_code') {
+    const code = params.get('code')
+    const codeVerifier = params.get('code_verifier')
+
+    if (!code) {
+      return Response.json({ error: 'invalid_request', error_description: 'code required' }, { status: 400 })
+    }
+
+    // Decode and verify the self-contained authorization code
+    const dotIdx = code.lastIndexOf('.')
+    if (dotIdx === -1) {
+      return Response.json({ error: 'invalid_grant' }, { status: 400 })
+    }
+
+    const payloadB64 = code.slice(0, dotIdx)
+    const signature = code.slice(dotIdx + 1)
+    let payload: string
+
+    try {
+      payload = base64urlDecodeString(payloadB64)
+    } catch {
+      return Response.json({ error: 'invalid_grant' }, { status: 400 })
+    }
+
+    // Verify HMAC signature
+    const expectedSig = await hmacSign(payload, env.OAUTH_CLIENT_SECRET)
+    if (signature !== expectedSig) {
+      return Response.json({ error: 'invalid_grant' }, { status: 400 })
+    }
+
+    const data = JSON.parse(payload) as {
+      cid: string
+      uri: string
+      cc: string
+      ccm: string
+      exp: number
+    }
+
+    // Check expiry
+    if (Date.now() > data.exp) {
+      return Response.json({ error: 'invalid_grant', error_description: 'code expired' }, { status: 400 })
+    }
+
+    // Check client_id matches
+    if (data.cid !== clientId) {
+      return Response.json({ error: 'invalid_grant' }, { status: 400 })
+    }
+
+    // Verify PKCE if a code_challenge was provided
+    if (data.cc && codeVerifier) {
+      const pkceValid = await verifyPkce(codeVerifier, data.cc, data.ccm || 'plain')
+      if (!pkceValid) {
+        return Response.json({ error: 'invalid_grant', error_description: 'PKCE verification failed' }, { status: 400 })
+      }
+    }
+
+    const accessToken = await generateAccessToken(clientId, env.OAUTH_CLIENT_SECRET)
+
+    return Response.json({
+      access_token: accessToken,
+      token_type: 'bearer',
+      scope: 'mcp',
+    })
+  }
+
+  if (grantType === 'client_credentials') {
+    const accessToken = await generateAccessToken(clientId, env.OAUTH_CLIENT_SECRET)
+
+    return Response.json({
+      access_token: accessToken,
+      token_type: 'bearer',
+      scope: 'mcp',
+    })
+  }
+
+  return Response.json({ error: 'unsupported_grant_type' }, { status: 400 })
 }
 
 // ---------------------------------------------------------------------------
@@ -338,7 +595,18 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
 
-    // Health check
+    // CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, Mcp-Session-Id',
+        },
+      })
+    }
+
+    // Health check (no auth required)
     if (url.pathname === '/health' && request.method === 'GET') {
       return Response.json({
         status: 'healthy',
@@ -346,6 +614,26 @@ export default {
         tools: 25,
       })
     }
+
+    // OAuth discovery endpoints (no auth required)
+    if (url.pathname === '/.well-known/oauth-authorization-server') {
+      return handleOAuthMetadata(request)
+    }
+    if (url.pathname === '/.well-known/oauth-protected-resource') {
+      return handleProtectedResourceMetadata(request)
+    }
+
+    // OAuth authorize endpoint (auto-approves, redirects back with code)
+    if (url.pathname === '/authorize') {
+      return handleAuthorize(request, env)
+    }
+
+    // OAuth token endpoint
+    if (url.pathname === '/oauth/token') {
+      return handleTokenRequest(request, env)
+    }
+
+    // --- Everything below requires auth ---
 
     // Only handle /mcp
     if (url.pathname !== '/mcp') {
@@ -366,16 +654,18 @@ export default {
       return new Response('Method not allowed', { status: 405 })
     }
 
-    // Auth check (if AUTH_TOKEN secret is set)
-    if (env.AUTH_TOKEN) {
-      const authHeader = request.headers.get('Authorization')
-      const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null
-      if (token !== env.AUTH_TOKEN) {
-        return Response.json(
-          { jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null },
-          { status: 401 },
-        )
-      }
+    // OAuth validation
+    const isAuthorized = await validateOAuthToken(request, env)
+    if (!isAuthorized) {
+      return Response.json(
+        { jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null },
+        {
+          status: 401,
+          headers: {
+            'WWW-Authenticate': `Bearer resource_metadata="${url.protocol}//${url.host}/.well-known/oauth-protected-resource"`,
+          },
+        },
+      )
     }
 
     // Parse JSON-RPC body
