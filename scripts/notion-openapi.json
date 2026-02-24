@@ -2302,7 +2302,7 @@
     "/v1/file_uploads/{file_upload_id}/send": {
       "post": {
         "summary": "Send file upload contents",
-        "description": "Uploads the actual file contents for a previously created file upload object. Uses multipart/form-data with the file under the 'file' key.",
+        "description": "Uploads the actual file contents for a previously created file upload object. The 'file' parameter accepts: a base64-encoded string of the file contents, a data URL (e.g. data:image/png;base64,...), or an HTTP(S) URL to fetch the file from. You can also pass optional 'filename' and 'content_type' string parameters alongside 'file'. When you have an image in your context, encode it as base64 and pass it directly in the 'file' parameter.",
         "operationId": "send-file-upload",
         "tags": [
           "File Uploads"
@@ -2333,8 +2333,15 @@
                 "properties": {
                   "file": {
                     "type": "string",
-                    "format": "binary",
-                    "description": "The file to upload"
+                    "description": "The file content as base64-encoded string, a data URL (data:mime;base64,...), or an HTTP(S) URL to fetch the file from"
+                  },
+                  "filename": {
+                    "type": "string",
+                    "description": "Optional filename (e.g. 'photo.jpg')"
+                  },
+                  "content_type": {
+                    "type": "string",
+                    "description": "Optional MIME type (e.g. 'image/jpeg'). Auto-detected if using data URL or HTTP URL."
                   },
                   "part_number": {
                     "type": "integer",
