@@ -5,6 +5,7 @@ import { OpenAPIV3 } from 'openapi-types'
 import OpenAPISchemaValidator from 'openapi-schema-validator'
 
 import { MCPProxy } from './openapi-mcp-server/mcp/proxy'
+import { createGetMediaTool } from './custom-tools/get-media'
 
 export class ValidationError extends Error {
   constructor(public errors: any[]) {
@@ -45,6 +46,26 @@ async function loadOpenApiSpec(specPath: string, baseUrl: string | undefined): P
 export async function initProxy(specPath: string, baseUrl: string |undefined) {
   const openApiSpec = await loadOpenApiSpec(specPath, baseUrl)
   const proxy = new MCPProxy('Notion API', openApiSpec)
+
+  // Register custom tools
+  const notionToken = process.env.NOTION_TOKEN
+  const headersJson = process.env.OPENAPI_MCP_HEADERS
+  let notionHeaders: Record<string, string> = {
+    'Notion-Version': '2025-09-03'
+  }
+
+  if (headersJson) {
+    try {
+      const parsed = JSON.parse(headersJson)
+      if (typeof parsed === 'object' && parsed !== null) {
+        notionHeaders = { ...notionHeaders, ...parsed }
+      }
+    } catch { /* fall through */ }
+  } else if (notionToken) {
+    notionHeaders['Authorization'] = `Bearer ${notionToken}`
+  }
+
+  proxy.registerCustomTool(createGetMediaTool(notionHeaders))
 
   return proxy
 }

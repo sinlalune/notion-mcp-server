@@ -6,6 +6,15 @@ import { HttpClient, HttpClientError } from '../client/http-client'
 import { OpenAPIV3 } from 'openapi-types'
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 
+export type CustomToolHandler = (params: Record<string, unknown>) => Promise<{
+  content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>
+}>
+
+export type CustomToolDefinition = {
+  tool: Tool
+  handler: CustomToolHandler
+}
+
 type PathItemObject = OpenAPIV3.PathItemObject & {
   get?: OpenAPIV3.OperationObject
   put?: OpenAPIV3.OperationObject
@@ -66,6 +75,7 @@ export class MCPProxy {
   private httpClient: HttpClient
   private tools: Record<string, NewToolDefinition>
   private openApiLookup: Record<string, OpenAPIV3.OperationObject & { method: string; path: string }>
+  private customTools: Map<string, CustomToolDefinition> = new Map()
 
   constructor(name: string, openApiSpec: OpenAPIV3.Document) {
     this.server = new Server({ name, version: '1.0.0' }, { capabilities: { tools: {} } })
@@ -90,12 +100,20 @@ export class MCPProxy {
     this.setupHandlers()
   }
 
+  registerCustomTool(definition: CustomToolDefinition) {
+    this.customTools.set(definition.tool.name, definition)
+  }
+
+  getHttpClient(): HttpClient {
+    return this.httpClient
+  }
+
   private setupHandlers() {
     // Handle tool listing
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       const tools: Tool[] = []
 
-      // Add methods as separate tools to match the MCP format
+      // Add auto-generated tools from OpenAPI spec
       Object.entries(this.tools).forEach(([toolName, def]) => {
         def.methods.forEach(method => {
           const toolNameWithMethod = `${toolName}-${method.name}`;
@@ -120,12 +138,24 @@ export class MCPProxy {
         })
       })
 
+      // Add custom tools
+      for (const [, definition] of this.customTools) {
+        tools.push(definition.tool)
+      }
+
       return { tools }
     })
 
     // Handle tool calling
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: params } = request.params
+
+      // Check custom tools first
+      const customTool = this.customTools.get(name)
+      if (customTool) {
+        const deserializedParams = params ? deserializeParams(params as Record<string, unknown>) : {}
+        return customTool.handler(deserializedParams)
+      }
 
       // Find the operation in OpenAPI spec
       const operation = this.findOperation(name)
