@@ -351,6 +351,48 @@ function deserializeParams(params: Record<string, unknown>): Record<string, unkn
 // OpenAPI operation executor (native fetch, no axios)
 // ---------------------------------------------------------------------------
 
+// Check if an operation expects multipart/form-data
+function isMultipartOperation(operation: OpenAPIV3.OperationObject): boolean {
+  if (!operation.requestBody) return false
+  const rb = operation.requestBody as OpenAPIV3.RequestBodyObject
+  return !!rb.content?.['multipart/form-data']
+}
+
+// Decode base64 (standard or URL-safe) to Uint8Array
+function decodeBase64ToBytes(b64: string): Uint8Array {
+  // Strip data URL prefix if present (e.g., "data:image/png;base64,iVBOR...")
+  const raw = b64.includes(',') && b64.startsWith('data:') ? b64.split(',')[1] : b64
+  const padded = raw.replace(/-/g, '+').replace(/_/g, '/') + '=='.slice(0, (4 - (raw.length % 4)) % 4)
+  const binary = atob(padded)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+// Resolve file value: could be base64 string, data URL, or a URL to fetch
+async function resolveFileValue(
+  value: string,
+): Promise<{ bytes: Uint8Array; detectedType: string }> {
+  // Data URL — extract mime type and decode base64 payload
+  if (value.startsWith('data:')) {
+    const match = value.match(/^data:([^;]+);base64,/)
+    const detectedType = match?.[1] || 'application/octet-stream'
+    return { bytes: decodeBase64ToBytes(value), detectedType }
+  }
+
+  // HTTP(S) URL — fetch the content
+  if (value.startsWith('http://') || value.startsWith('https://')) {
+    const resp = await fetch(value)
+    if (!resp.ok) throw new Error(`Failed to fetch file from URL: ${resp.status}`)
+    const detectedType = resp.headers.get('Content-Type') || 'application/octet-stream'
+    const buf = await resp.arrayBuffer()
+    return { bytes: new Uint8Array(buf), detectedType }
+  }
+
+  // Plain base64 string
+  return { bytes: decodeBase64ToBytes(value), detectedType: 'application/octet-stream' }
+}
+
 async function executeOperation(
   baseUrl: string,
   headers: Record<string, string>,
@@ -394,14 +436,39 @@ async function executeOperation(
     ['POST', 'PATCH', 'PUT', 'DELETE'].includes(method) && Object.keys(bodyParams).length > 0
 
   const fetchHeaders: Record<string, string> = { ...headers }
-  if (!hasBody) {
+
+  // Build request body — multipart/form-data for file uploads, JSON otherwise
+  let body: BodyInit | undefined
+  const isMultipart = isMultipartOperation(operation)
+
+  if (hasBody && isMultipart) {
+    // For multipart: build FormData with file as Blob
+    // Accepts base64 string, data URL, or HTTP(S) URL for the "file" param
+    const formData = new FormData()
+    for (const [key, value] of Object.entries(bodyParams)) {
+      if (key === 'file' && typeof value === 'string') {
+        const filename = (bodyParams.filename as string) || 'upload'
+        const explicitType = bodyParams.content_type as string | undefined
+        const { bytes, detectedType } = await resolveFileValue(value)
+        const contentType = explicitType || detectedType
+        formData.append('file', new Blob([bytes], { type: contentType }), filename)
+      } else if (key !== 'filename' && key !== 'content_type') {
+        formData.append(key, typeof value === 'object' ? JSON.stringify(value) : String(value))
+      }
+    }
+    body = formData
+    // Remove Content-Type so fetch sets the multipart boundary automatically
+    delete fetchHeaders['Content-Type']
+  } else if (hasBody) {
+    body = JSON.stringify(bodyParams)
+  } else {
     delete fetchHeaders['Content-Type']
   }
 
   const response = await fetch(url, {
     method,
     headers: fetchHeaders,
-    body: hasBody ? JSON.stringify(bodyParams) : undefined,
+    body,
   })
 
   const data: unknown = await response.json().catch(() => ({}))
@@ -612,6 +679,7 @@ export default {
         status: 'healthy',
         timestamp: new Date().toISOString(),
         tools: 25,
+        version: 'oauth-v2',
       })
     }
 
