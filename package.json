@@ -14,7 +14,9 @@
     "dev": "tsx watch scripts/start-server.ts",
     "test": "NODE_ENV=test vitest run",
     "test:watch": "NODE_ENV=test vitest",
-    "test:coverage": "NODE_ENV=test vitest run --coverage"
+    "test:coverage": "NODE_ENV=test vitest run --coverage",
+    "deploy": "wrangler deploy",
+    "dev:worker": "wrangler dev"
   },
   "bin": {
     "notion-mcp-server": "bin/cli.mjs"
@@ -47,7 +49,8 @@
     "openai": "^4.91.1",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2",
-    "vitest": "^4.0.18"
+    "vitest": "^4.0.18",
+    "wrangler": "^4.68.1"
   },
   "description": "Official MCP server for Notion API",
   "main": "index.js",

@@ -1,0 +1,8 @@
+name = "notion-mcp-server"
+main = "src/worker.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Secrets (set via `npx wrangler secret put`):
+#   NOTION_TOKEN  - Your Notion integration token (required)
+#   AUTH_TOKEN    - Bearer token for MCP endpoint auth (optional)
