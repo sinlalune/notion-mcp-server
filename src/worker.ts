@@ -369,6 +369,27 @@ function decodeBase64ToBytes(b64: string): Uint8Array {
   return bytes
 }
 
+// Detect MIME type from file magic bytes
+function detectMimeType(bytes: Uint8Array): string {
+  if (bytes.length < 4) return 'application/octet-stream'
+  const h = (i: number) => bytes[i]
+
+  // JPEG: FF D8 FF
+  if (h(0) === 0xff && h(1) === 0xd8 && h(2) === 0xff) return 'image/jpeg'
+  // PNG: 89 50 4E 47
+  if (h(0) === 0x89 && h(1) === 0x50 && h(2) === 0x4e && h(3) === 0x47) return 'image/png'
+  // GIF: 47 49 46 38
+  if (h(0) === 0x47 && h(1) === 0x49 && h(2) === 0x46 && h(3) === 0x38) return 'image/gif'
+  // WebP: 52 49 46 46 ... 57 45 42 50
+  if (h(0) === 0x52 && h(1) === 0x49 && h(2) === 0x46 && h(3) === 0x46 && bytes.length > 11 && h(8) === 0x57 && h(9) === 0x45 && h(10) === 0x42 && h(11) === 0x50) return 'image/webp'
+  // PDF: 25 50 44 46
+  if (h(0) === 0x25 && h(1) === 0x50 && h(2) === 0x44 && h(3) === 0x46) return 'application/pdf'
+  // HEIC/HEIF: ... 66 74 79 70 (ftyp at offset 4)
+  if (bytes.length > 11 && h(4) === 0x66 && h(5) === 0x74 && h(6) === 0x79 && h(7) === 0x70) return 'image/heic'
+
+  return 'application/octet-stream'
+}
+
 // Resolve file value: could be base64 string, data URL, or a URL to fetch
 async function resolveFileValue(
   value: string,
@@ -389,8 +410,10 @@ async function resolveFileValue(
     return { bytes: new Uint8Array(buf), detectedType }
   }
 
-  // Plain base64 string
-  return { bytes: decodeBase64ToBytes(value), detectedType: 'application/octet-stream' }
+  // Plain base64 string — decode then detect MIME from magic bytes
+  const bytes = decodeBase64ToBytes(value)
+  const detectedType = detectMimeType(bytes)
+  return { bytes, detectedType }
 }
 
 async function executeOperation(
@@ -580,6 +603,108 @@ function buildToolRegistry(env: Env): Map<string, ToolEntry> {
     handler: mediaDef.handler,
   })
 
+  // Register describe-image-to-page custom tool (generates ASCII art description and appends to page)
+  registry.set('describe-image-to-page', {
+    tool: {
+      name: 'describe-image-to-page',
+      description:
+        'When you see an image in the conversation (photo, screenshot, schema, diagram, wireframe, etc.), use this tool to describe it and append a visual representation to a Notion page. ' +
+        'You MUST provide: a detailed text description, and an ASCII art representation of what you see. ' +
+        'For SCHEMAS/DIAGRAMS/WIREFRAMES: reproduce the structure faithfully using box-drawing characters (┌─┐│└─┘├┤┬┴┼), arrows (→←↑↓↔), and Unicode blocks (░▒▓█). ' +
+        'For PHOTOS: use shading characters (░▒▓█) and line art to represent the visual content. ' +
+        'Use this instead of file upload when the user shares any visual content in the chat.',
+      inputSchema: {
+        type: 'object',
+        required: ['page_id', 'description', 'ascii_art'],
+        properties: {
+          page_id: {
+            type: 'string',
+            description: 'The Notion page ID to append the content to',
+          },
+          description: {
+            type: 'string',
+            description: 'A detailed text description of the image (what you see, colors, objects, context)',
+          },
+          ascii_art: {
+            type: 'string',
+            description: 'An ASCII art representation of the image. Use characters like ░▒▓█ for shading, and line art for shapes. Make it as detailed as possible.',
+          },
+          caption: {
+            type: 'string',
+            description: 'Optional short caption for the image',
+          },
+        },
+      },
+      annotations: { title: 'Describe Image To Page' },
+    },
+    handler: async (params) => {
+      try {
+        const pageId = params.page_id as string
+        const description = params.description as string
+        const asciiArt = params.ascii_art as string
+        const caption = (params.caption as string) || 'Image description'
+
+        const notionHeaders: Record<string, string> = {
+          Authorization: `Bearer ${env.NOTION_TOKEN}`,
+          'Notion-Version': '2025-09-03',
+          'Content-Type': 'application/json',
+        }
+
+        const children = [
+          {
+            type: 'heading_3',
+            heading_3: {
+              rich_text: [{ type: 'text', text: { content: `📷 ${caption}` } }],
+            },
+          },
+          {
+            type: 'paragraph',
+            paragraph: {
+              rich_text: [{ type: 'text', text: { content: description } }],
+            },
+          },
+          {
+            type: 'code',
+            code: {
+              rich_text: [{ type: 'text', text: { content: asciiArt } }],
+              language: 'plain text',
+            },
+          },
+        ]
+
+        const appendResp = await fetch(`https://api.notion.com/v1/blocks/${pageId}/children`, {
+          method: 'PATCH',
+          headers: notionHeaders,
+          body: JSON.stringify({ children }),
+        })
+        if (!appendResp.ok) {
+          const err = await appendResp.text()
+          return { content: [{ type: 'text', text: `Failed to append to page: ${err}` }], isError: true }
+        }
+
+        const result = await appendResp.json()
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                page_id: pageId,
+                blocks_added: 3,
+                ...result,
+              }),
+            },
+          ],
+        }
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: `Failed: ${(error as Error).message}` }],
+          isError: true,
+        }
+      }
+    },
+  })
+
   return registry
 }
 
@@ -605,6 +730,41 @@ async function handleJsonRpc(
           protocolVersion: '2024-11-05',
           capabilities: { tools: {} },
           serverInfo: { name: 'Notion API', version: '1.0.0' },
+          instructions: [
+            'RÈGLES OBLIGATOIRES pour la gestion des tickets Notion :',
+            '',
+            '1. CRÉATION / MISE À JOUR DE TICKETS :',
+            '   - Avant tout traitement, remplir TOUS les champs disponibles du ticket (titre, statut, priorité, assigné, tags, dates, description, etc.).',
+            '   - Si des informations manquent, demander à l\'utilisateur AVANT de créer le ticket.',
+            '   - Ne jamais laisser de champs vides si une valeur peut être déduite du contexte.',
+            '   - UTILISER les documents de connaissance du projet (architecture, stack technique, conventions, etc.) pour :',
+            '     • Identifier les composants/modules concernés par le ticket',
+            '     • Ajouter le contexte technique pertinent dans la description',
+            '     • Suggérer les fichiers/dossiers probablement impactés',
+            '     • Référencer les patterns et conventions du projet',
+            '     • Estimer la complexité en fonction de l\'architecture connue',
+            '',
+            '2. IMAGES, SCHÉMAS ET DIAGRAMMES (OBLIGATOIRE) :',
+            '   - Quand l\'utilisateur partage UNE OU PLUSIEURS IMAGES dans la conversation, tu DOIS appeler le tool describe-image-to-page pour CHAQUE image.',
+            '   - C\'est NON NÉGOCIABLE : toute image visible dans le chat doit être transcrite sur la page Notion.',
+            '   - Croquis/schémas sur cahier : reproduire FIDÈLEMENT la structure dessinée en ASCII avec box-drawing (┌─┐│└─┘├┤┬┴┼), flèches (→←↑↓↔).',
+            '   - Wireframes/maquettes : reproduire la disposition des éléments UI en ASCII.',
+            '   - Photos : décrire en détail + représentation ASCII avec ░▒▓█.',
+            '   - Si le ticket contient une image, appeler describe-image-to-page AVANT de confirmer la création du ticket à l\'utilisateur.',
+            '',
+            '3. APRÈS TRAITEMENT (développement, fix, analyse, etc.) :',
+            '   - Ajouter un COMMENTAIRE sur le ticket avec une synthèse claire du travail réalisé :',
+            '     • Ce qui a été fait',
+            '     • Les fichiers modifiés',
+            '     • Les décisions techniques prises',
+            '',
+            '4. FIXES ET SUIVIS :',
+            '   - Si des corrections (fixes) sont nécessaires après le traitement initial, ajouter un commentaire pour chaque fix avec :',
+            '     • La description du problème trouvé',
+            '     • La correction appliquée',
+            '     • L\'impact sur le ticket',
+            '   - Mettre à jour le statut du ticket en conséquence.',
+          ].join('\n'),
         },
       }
 
