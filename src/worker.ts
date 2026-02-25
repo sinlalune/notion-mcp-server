@@ -29,6 +29,8 @@ interface Env {
   NOTION_TOKEN: string
   OAUTH_CLIENT_ID: string
   OAUTH_CLIENT_SECRET: string
+  OBSIDIAN_API_KEY: string
+  OBSIDIAN_BASE_URL: string // Cloudflare Tunnel URL (e.g. https://obsidian.your-domain.com)
 }
 
 interface JsonRpcRequest {
@@ -705,6 +707,201 @@ function buildToolRegistry(env: Env): Map<string, ToolEntry> {
     },
   })
 
+  // -------------------------------------------------------------------------
+  // Obsidian Local REST API tools (via Cloudflare Tunnel)
+  // Docs: https://coddingtonbear.github.io/obsidian-local-rest-api/
+  // -------------------------------------------------------------------------
+
+  const obsidianBaseUrl = (env.OBSIDIAN_BASE_URL || '').replace(/\/+$/, '')
+  const obsidianAuth = `Bearer ${env.OBSIDIAN_API_KEY || ''}`
+
+  // Encode each path segment individually so slashes are preserved
+  function encodeVaultPath(rawPath: string): string {
+    return rawPath
+      .split('/')
+      .map((seg) => encodeURIComponent(seg))
+      .join('/')
+  }
+
+  if (obsidianBaseUrl && env.OBSIDIAN_API_KEY) {
+    // 1. Read a note by path
+    //    GET /vault/{filename} with Accept: text/markdown
+    registry.set('obsidian-read-note', {
+      tool: {
+        name: 'obsidian-read-note',
+        description:
+          'Read the content of a note from the Obsidian vault by its file path (relative to vault root, e.g. "Folder/Note.md").',
+        inputSchema: {
+          type: 'object',
+          required: ['path'],
+          properties: {
+            path: {
+              type: 'string',
+              description: 'Path to the note relative to vault root (e.g. "Daily/2026-02-25.md")',
+            },
+          },
+        },
+        annotations: { title: 'Obsidian Read Note', readOnlyHint: true },
+      },
+      handler: async (params) => {
+        try {
+          const vaultPath = encodeVaultPath(String(params.path))
+          const resp = await fetch(`${obsidianBaseUrl}/vault/${vaultPath}`, {
+            method: 'GET',
+            headers: { Authorization: obsidianAuth, Accept: 'text/markdown' },
+          })
+          if (!resp.ok) {
+            const err = await resp.text()
+            return { content: [{ type: 'text', text: `Error ${resp.status}: ${err}` }], isError: true }
+          }
+          const text = await resp.text()
+          return { content: [{ type: 'text', text }] }
+        } catch (error) {
+          return { content: [{ type: 'text', text: `Failed: ${(error as Error).message}` }], isError: true }
+        }
+      },
+    })
+
+    // 2. Create or update a note
+    //    PUT /vault/{filename} with Content-Type: text/markdown
+    //    Creates parent folders automatically. Overwrites if exists.
+    registry.set('obsidian-put-note', {
+      tool: {
+        name: 'obsidian-put-note',
+        description:
+          'Create or overwrite a note in the Obsidian vault. If the note already exists it will be replaced. Parent folders are created automatically.',
+        inputSchema: {
+          type: 'object',
+          required: ['path', 'content'],
+          properties: {
+            path: {
+              type: 'string',
+              description: 'Path to the note relative to vault root (e.g. "Projects/idea.md")',
+            },
+            content: {
+              type: 'string',
+              description: 'Markdown content of the note',
+            },
+          },
+        },
+        annotations: { title: 'Obsidian Create/Update Note', destructiveHint: true },
+      },
+      handler: async (params) => {
+        try {
+          const vaultPath = encodeVaultPath(String(params.path))
+          const resp = await fetch(`${obsidianBaseUrl}/vault/${vaultPath}`, {
+            method: 'PUT',
+            headers: { Authorization: obsidianAuth, 'Content-Type': 'text/markdown' },
+            body: String(params.content),
+          })
+          if (!resp.ok) {
+            const err = await resp.text()
+            return { content: [{ type: 'text', text: `Error ${resp.status}: ${err}` }], isError: true }
+          }
+          return { content: [{ type: 'text', text: JSON.stringify({ status: 'success', path: params.path }) }] }
+        } catch (error) {
+          return { content: [{ type: 'text', text: `Failed: ${(error as Error).message}` }], isError: true }
+        }
+      },
+    })
+
+    // 3. Search notes by keyword
+    //    POST /search/simple/?query={query}&contextLength={n}
+    //    Query is passed as a URL query parameter, NOT in the body.
+    registry.set('obsidian-search-notes', {
+      tool: {
+        name: 'obsidian-search-notes',
+        description:
+          'Search for notes in the Obsidian vault by keyword. Returns matching file paths and context snippets.',
+        inputSchema: {
+          type: 'object',
+          required: ['query'],
+          properties: {
+            query: {
+              type: 'string',
+              description: 'Search query (keyword or phrase to find in notes)',
+            },
+            contextLength: {
+              type: 'number',
+              description: 'Number of characters of context to return around each match (default: 100)',
+              default: 100,
+            },
+          },
+        },
+        annotations: { title: 'Obsidian Search Notes', readOnlyHint: true },
+      },
+      handler: async (params) => {
+        try {
+          const searchParams = new URLSearchParams()
+          searchParams.set('query', String(params.query))
+          if (params.contextLength !== undefined) {
+            searchParams.set('contextLength', String(params.contextLength))
+          }
+          const resp = await fetch(`${obsidianBaseUrl}/search/simple/?${searchParams.toString()}`, {
+            method: 'POST',
+            headers: { Authorization: obsidianAuth, Accept: 'application/json' },
+          })
+          if (!resp.ok) {
+            const err = await resp.text()
+            return { content: [{ type: 'text', text: `Error ${resp.status}: ${err}` }], isError: true }
+          }
+          const results = await resp.json()
+          return { content: [{ type: 'text', text: JSON.stringify(results) }] }
+        } catch (error) {
+          return { content: [{ type: 'text', text: `Failed: ${(error as Error).message}` }], isError: true }
+        }
+      },
+    })
+
+    // 4. List notes in a folder
+    //    GET /vault/{pathToDirectory}/ (trailing slash = directory listing)
+    //    GET /vault/ for root listing
+    registry.set('obsidian-list-notes', {
+      tool: {
+        name: 'obsidian-list-notes',
+        description:
+          'List all files and folders inside a given directory in the Obsidian vault. Use "/" or empty string for the vault root.',
+        inputSchema: {
+          type: 'object',
+          required: [],
+          properties: {
+            path: {
+              type: 'string',
+              description: 'Folder path relative to vault root (e.g. "Daily" or "/"). Defaults to vault root.',
+              default: '/',
+            },
+          },
+        },
+        annotations: { title: 'Obsidian List Notes', readOnlyHint: true },
+      },
+      handler: async (params) => {
+        try {
+          const rawPath = String(params.path || '/')
+          // For root, use /vault/. For subfolders, use /vault/{path}/ (trailing slash required)
+          let url: string
+          if (rawPath === '/' || rawPath === '') {
+            url = `${obsidianBaseUrl}/vault/`
+          } else {
+            const encoded = encodeVaultPath(rawPath.replace(/\/+$/, ''))
+            url = `${obsidianBaseUrl}/vault/${encoded}/`
+          }
+          const resp = await fetch(url, {
+            method: 'GET',
+            headers: { Authorization: obsidianAuth, Accept: 'application/json' },
+          })
+          if (!resp.ok) {
+            const err = await resp.text()
+            return { content: [{ type: 'text', text: `Error ${resp.status}: ${err}` }], isError: true }
+          }
+          const listing = await resp.json()
+          return { content: [{ type: 'text', text: JSON.stringify(listing) }] }
+        } catch (error) {
+          return { content: [{ type: 'text', text: `Failed: ${(error as Error).message}` }], isError: true }
+        }
+      },
+    })
+  }
+
   return registry
 }
 
@@ -838,7 +1035,7 @@ export default {
       return Response.json({
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        tools: 25,
+        tools: 29,
         version: 'oauth-v2',
       })
     }

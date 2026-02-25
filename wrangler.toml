@@ -4,5 +4,7 @@ compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 
 # Secrets (set via `npx wrangler secret put`):
-#   NOTION_TOKEN  - Your Notion integration token (required)
-#   AUTH_TOKEN    - Bearer token for MCP endpoint auth (optional)
+#   NOTION_TOKEN      - Your Notion integration token (required)
+#   AUTH_TOKEN         - Bearer token for MCP endpoint auth (optional)
+#   OBSIDIAN_API_KEY   - Obsidian Local REST API bearer token
+#   OBSIDIAN_BASE_URL  - Cloudflare Tunnel URL to Obsidian (e.g. https://obsidian.your-domain.com)

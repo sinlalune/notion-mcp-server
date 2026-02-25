@@ -1,0 +1,24 @@
+# Cloudflare Tunnel configuration for exposing Obsidian Local REST API
+#
+# Setup steps:
+#   1. Install cloudflared: winget install Cloudflare.cloudflared
+#   2. Authenticate:        cloudflared tunnel login
+#   3. Create tunnel:       cloudflared tunnel create obsidian-api
+#   4. Route DNS:           cloudflared tunnel route dns obsidian-api obsidian.YOUR-DOMAIN.com
+#   5. Copy this file to:   ~/.cloudflared/config.yml
+#   6. Start tunnel:        cloudflared tunnel run obsidian-api
+#
+# Prerequisites:
+#   - Obsidian is running with the "Local REST API" community plugin enabled
+#   - The plugin is configured to listen on https://127.0.0.1:27124
+#   - You have noted the API key from the plugin settings
+
+tunnel: obsidian-api   # Replace with your tunnel ID after `cloudflared tunnel create`
+credentials-file: ~/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: obsidian.YOUR-DOMAIN.com   # Replace with your actual domain
+    service: https://127.0.0.1:27124
+    originRequest:
+      noTLSVerify: true   # Obsidian Local REST API uses a self-signed cert
+  - service: http_status:404
